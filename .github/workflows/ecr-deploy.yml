@@ -1,4 +1,4 @@
-name: Build and Push to ECR
+name: Build, Push to ECR, and Deploy to ECS
 
 on:
   push:
@@ -8,7 +8,7 @@ on:
 
 jobs:
   build-and-push:
-    name: Build and Push to ECR
+    name: Build, Push, and Deploy
     runs-on: ubuntu-latest
     
     steps:
@@ -27,6 +27,7 @@ jobs:
       uses: aws-actions/amazon-ecr-login@v1
     
     - name: Build, tag, and push image to Amazon ECR
+      id: build-image
       env:
         ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
         ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
@@ -40,4 +41,39 @@ jobs:
         docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
         docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
         
-        echo "::set-output name=image::$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+        echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+    
+    - name: Download task definition
+      run: |
+        aws ecs describe-task-definition --task-definition ${{ secrets.ECS_TASK_DEFINITION }} \
+        --query taskDefinition > task-definition.json
+    
+    - name: Fill in the new image ID in the Amazon ECS task definition
+      id: task-def
+      uses: aws-actions/amazon-ecs-render-task-definition@v1
+      with:
+        task-definition: task-definition.json
+        container-name: ${{ secrets.CONTAINER_NAME }}
+        image: ${{ steps.build-image.outputs.image }}
+    
+    - name: Deploy Amazon ECS task definition
+      id: deploy
+      uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+      with:
+        task-definition: ${{ steps.task-def.outputs.task-definition }}
+        service: ${{ secrets.ECS_SERVICE }}
+        cluster: ${{ secrets.ECS_CLUSTER }}
+        wait-for-service-stability: true
+        
+    - name: Deployment status
+      if: always()
+      run: |
+        if [ "${{ steps.deploy.outcome }}" == "success" ]; then
+          echo "✅ Deployment completed successfully!"
+          echo "Service: ${{ secrets.ECS_SERVICE }}"
+          echo "Cluster: ${{ secrets.ECS_CLUSTER }}"
+          echo "New image: ${{ steps.build-image.outputs.image }}"
+        else
+          echo "❌ Deployment failed!"
+          exit 1
+        fi
