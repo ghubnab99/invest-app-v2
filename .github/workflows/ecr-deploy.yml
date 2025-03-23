@@ -43,118 +43,83 @@ jobs:
         
         echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
     
-    - name: Extract task definition components
-      id: extract-task-def
+    - name: Deploy to ECS using AWS CLI
+      id: deploy
       run: |
-        # Download the current task definition
-        aws ecs describe-task-definition --task-definition ${{ secrets.ECS_TASK_DEFINITION }} \
-          --query 'taskDefinition' > original-task-def.json
+        echo "Starting deployment to ECS..."
         
-        # Extract essential components while removing problematic fields
-        echo "Extracting essential components from task definition..."
+        # Get the current task definition
+        echo "Retrieving current task definition..."
+        TASK_DEFINITION_FAMILY="${{ secrets.ECS_TASK_DEFINITION }}"
+        aws ecs describe-task-definition --task-definition "$TASK_DEFINITION_FAMILY" > task-def-description.json
         
-        # Get container definitions but remove any enableFaultInjection fields
-        jq '.containerDefinitions' original-task-def.json > container-defs.json
+        # Get the revision number
+        REVISION=$(jq -r '.taskDefinition.revision' task-def-description.json)
+        TASK_DEFINITION_ARN=$(jq -r '.taskDefinition.taskDefinitionArn' task-def-description.json)
+        echo "Current task definition: $TASK_DEFINITION_ARN (revision $REVISION)"
         
-        # Extract other necessary fields individually
-        FAMILY=$(jq -r '.family' original-task-def.json)
-        echo "family=$FAMILY" >> $GITHUB_OUTPUT
-        
-        CPU=$(jq -r '.cpu // "256"' original-task-def.json)
-        echo "cpu=$CPU" >> $GITHUB_OUTPUT
-        
-        MEMORY=$(jq -r '.memory // "512"' original-task-def.json) 
-        echo "memory=$MEMORY" >> $GITHUB_OUTPUT
-        
-        # Extract role ARNs if they exist
-        EXECUTION_ROLE=$(jq -r '.executionRoleArn // ""' original-task-def.json)
-        if [ ! -z "$EXECUTION_ROLE" ]; then
-          echo "execution_role=$EXECUTION_ROLE" >> $GITHUB_OUTPUT
-        fi
-        
-        TASK_ROLE=$(jq -r '.taskRoleArn // ""' original-task-def.json)
-        if [ ! -z "$TASK_ROLE" ]; then
-          echo "task_role=$TASK_ROLE" >> $GITHUB_OUTPUT
-        fi
-        
-        # Extract network mode
-        NETWORK_MODE=$(jq -r '.networkMode // "awsvpc"' original-task-def.json)
-        echo "network_mode=$NETWORK_MODE" >> $GITHUB_OUTPUT
-        
-        # Extract any volume definitions if they exist
-        jq '.volumes // []' original-task-def.json > volumes.json
-    
-    - name: Create clean task definition
-      id: create-task-def
-      run: |
-        # Create a new, clean task definition JSON
-        echo "Creating new task definition..."
-        
-        # Start with the basic structure
-        echo '{
-          "family": "${{ steps.extract-task-def.outputs.family }}",
-          "cpu": "${{ steps.extract-task-def.outputs.cpu }}",
-          "memory": "${{ steps.extract-task-def.outputs.memory }}",
-          "networkMode": "${{ steps.extract-task-def.outputs.network_mode }}"
-        }' > new-task-def.json
-        
-        # Add roles if they exist
-        if [ ! -z "${{ steps.extract-task-def.outputs.execution_role }}" ]; then
-          jq '.executionRoleArn = "${{ steps.extract-task-def.outputs.execution_role }}"' new-task-def.json > temp.json && mv temp.json new-task-def.json
-        fi
-        
-        if [ ! -z "${{ steps.extract-task-def.outputs.task_role }}" ]; then
-          jq '.taskRoleArn = "${{ steps.extract-task-def.outputs.task_role }}"' new-task-def.json > temp.json && mv temp.json new-task-def.json
-        fi
-        
-        # Add container definitions
-        jq --slurpfile containers container-defs.json '.containerDefinitions = $containers[0]' new-task-def.json > temp.json && mv temp.json new-task-def.json
-        
-        # Add volumes if they exist and aren't empty
-        VOLUMES_SIZE=$(jq 'length' volumes.json)
-        if [ $VOLUMES_SIZE -gt 0 ]; then
-          jq --slurpfile vols volumes.json '.volumes = $vols[0]' new-task-def.json > temp.json && mv temp.json new-task-def.json
-        fi
-        
-        # Check for other required parameters based on network mode
-        if [ "${{ steps.extract-task-def.outputs.network_mode }}" == "awsvpc" ]; then
-          # Extract and add requiredCompatibilities if they exist
-          jq '.requiredCompatibilities // ["EC2", "FARGATE"]' original-task-def.json > compat.json
-          jq --slurpfile compat compat.json '.requiredCompatibilities = $compat[0]' new-task-def.json > temp.json && mv temp.json new-task-def.json
-        fi
-        
-        # Update the container image in the new task definition
+        # Get the container name
         CONTAINER_NAME="${{ secrets.CONTAINER_NAME }}"
         NEW_IMAGE="${{ steps.build-image.outputs.image }}"
+        echo "Updating container $CONTAINER_NAME with image $NEW_IMAGE"
         
-        jq --arg name "$CONTAINER_NAME" --arg image "$NEW_IMAGE" \
-          '.containerDefinitions |= map(if .name == $name then .image = $image else . end)' \
-          new-task-def.json > task-definition.json
+        # Extract current container definitions
+        jq '.taskDefinition.containerDefinitions' task-def-description.json > container-defs.json
         
-        # Display the final task definition for debugging
-        echo "Final task definition:"
-        cat task-definition.json
+        # Update the image in the container definitions
+        jq --arg container "$CONTAINER_NAME" --arg image "$NEW_IMAGE" '
+          map(if .name == $container then .image = $image else . end)
+        ' container-defs.json > updated-container-defs.json
+        
+        # Create a new task definition - this is a direct approach 
+        # that only includes container definitions to avoid parameter issues
+        aws ecs register-task-definition \
+          --family "$TASK_DEFINITION_FAMILY" \
+          --container-definitions "$(cat updated-container-defs.json)" \
+          --execution-role-arn "$(jq -r '.taskDefinition.executionRoleArn // ""' task-def-description.json)" \
+          --task-role-arn "$(jq -r '.taskDefinition.taskRoleArn // ""' task-def-description.json)" \
+          --network-mode "$(jq -r '.taskDefinition.networkMode // "bridge"' task-def-description.json)" \
+          --cpu "$(jq -r '.taskDefinition.cpu // ""' task-def-description.json)" \
+          --memory "$(jq -r '.taskDefinition.memory // ""' task-def-description.json)" \
+          --requires-compatibilities "$(jq -r '.taskDefinition.requiresCompatibilities // [] | join(",")' task-def-description.json)" \
+          > register-result.json
+        
+        # Extract the new task definition ARN
+        NEW_TASK_DEFINITION_ARN=$(jq -r '.taskDefinition.taskDefinitionArn' register-result.json)
+        echo "New task definition registered: $NEW_TASK_DEFINITION_ARN"
+        
+        # Update the service with the new task definition
+        echo "Updating ECS service..."
+        aws ecs update-service \
+          --cluster "${{ secrets.ECS_CLUSTER }}" \
+          --service "${{ secrets.ECS_SERVICE }}" \
+          --task-definition "$NEW_TASK_DEFINITION_ARN" \
+          --force-new-deployment \
+          > update-service-result.json
+        
+        # Wait for the service to stabilize
+        echo "Waiting for service to stabilize..."
+        aws ecs wait services-stable \
+          --cluster "${{ secrets.ECS_CLUSTER }}" \
+          --services "${{ secrets.ECS_SERVICE }}"
+        
+        if [ $? -eq 0 ]; then
+          echo "✅ Deployment completed successfully!"
+          echo "Service: ${{ secrets.ECS_SERVICE }}"
+          echo "Cluster: ${{ secrets.ECS_CLUSTER }}"
+          echo "New task definition: $NEW_TASK_DEFINITION_ARN"
+          echo "New image: $NEW_IMAGE"
+        else
+          echo "❌ Deployment failed to stabilize!"
+          exit 1
+        fi
     
-    - name: Deploy Amazon ECS task definition
-      id: deploy
-      uses: aws-actions/amazon-ecs-deploy-task-definition@v1
-      with:
-        task-definition: task-definition.json
-        service: ${{ secrets.ECS_SERVICE }}
-        cluster: ${{ secrets.ECS_CLUSTER }}
-        wait-for-service-stability: true
-        
     - name: Deployment status
       if: always()
       run: |
         if [ "${{ steps.deploy.outcome }}" == "success" ]; then
-          echo "✅ Deployment completed successfully!"
-          echo "Service: ${{ secrets.ECS_SERVICE }}"
-          echo "Cluster: ${{ secrets.ECS_CLUSTER }}"
-          echo "New image: ${{ steps.build-image.outputs.image }}"
+          echo "✅ Overall deployment process completed successfully!"
         else
-          echo "❌ Deployment failed!"
-          echo "For debugging purposes, here's the content of the task definition:"
-          cat task-definition.json
+          echo "❌ Deployment process failed!"
           exit 1
         fi
